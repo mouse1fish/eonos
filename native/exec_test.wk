@@ -1,0 +1,10 @@
+# exec_test.wk —— execCapture/jsonGetStr 隔离测试（不含 HTTP 层）
+actor Main {
+    on Start {
+        body: Str = "{\"command\":\"echo hello-eonos-exec\"}"
+        cmd: Str = jsonGetStr(body, "command")
+        print("cmd=[", cmd, "] len=", strLen(cmd))
+        r: Str = execCapture(cmd)
+        print("r=[", r, "] len=", strLen(r))
+    }
+}

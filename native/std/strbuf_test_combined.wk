@@ -1,0 +1,118 @@
+﻿# strbuf_test.wk —— strbuf 标准库验收：追加/倍增扩容/整数/读取
+# 期望输出：sb 基本功能 OK / 长串扩容 OK / 整数追加 OK
+actor Main {
+# strbuf.inc.wk —— EonOS 标准库·动态字符串（可拼接片段，Hare growable slice 思路）
+#
+# 用法：把本文件的 def 群整段拼进需要它的 actor（wkcc 暂无 include/import 机制，
+#       跨 actor def 调用也不支持；拼接由构建脚本完成，如 eonos/native/build.ps1）。
+#
+# 句柄布局（24 字节，rt_alloc 分配）：
+#   [0..8)   buf  Ptr   数据区（NUL 结尾）
+#   [8..16)  len  Int   当前长度（不含 NUL）
+#   [16..24) cap  Int   数据区容量
+#
+# 增长策略：cap 不足时倍增（Hare 同款），copyBytes 迁移旧数据。
+# 内存：bump 分配器不回收，句柄与数据区随连接/任务生命周期一次性消耗。
+# 依赖：ptrToInt / intToPtr（2026-11-02 新增的 cast 内置，双侧编译器已支持）。
+
+# sbNew() -> Ptr：新建空 strbuf（初始容量 64）
+def sbNew -> Ptr {
+    sb: Ptr = alloc(24)
+    buf: Ptr = alloc(64)
+    store8(buf, 0)
+    store64(sb, ptrToInt(buf))
+    store64(ptrAdd(sb, 8), 0)
+    store64(ptrAdd(sb, 16), 64)
+    return sb
+}
+
+# sbCapFor(len: Int) -> Int：按需容量（64 起步，倍增至 ≥ len+1）
+def sbCapFor[len: Int] -> Int {
+    c: Int = 64
+    while c < len + 1 {
+        c = c * 2
+    }
+    return c
+}
+
+# sbGrow(sb: Ptr, need: Int) -> Ptr：确保容量 ≥ need+1，必要时倍增迁移（返回句柄）
+def sbGrow[sb: Ptr, need: Int] -> Ptr {
+    cap: Int = load64(ptrAdd(sb, 16))
+    if need < cap {
+        return sb
+    }
+    nc: Int = sbCapFor(need)
+    nbuf: Ptr = alloc(nc)
+    oldLen: Int = load64(ptrAdd(sb, 8))
+    copyBytes(nbuf, intToPtr(load64(sb)), oldLen + 1)
+    store64(sb, ptrToInt(nbuf))
+    store64(ptrAdd(sb, 16), nc)
+    return sb
+}
+
+# sbAppendStr(sb: Ptr, s: Str) -> Ptr：追加字符串
+def sbAppendStr[sb: Ptr, s: Str] -> Ptr {
+    n: Int = strLen(s)
+    sb2: Ptr = sbGrow(sb, load64(ptrAdd(sb, 8)) + n)
+    b: Ptr = intToPtr(load64(sb2))
+    off: Int = load64(ptrAdd(sb2, 8))
+    copyBytes(ptrAdd(b, off), strPtr(s), n)
+    store8(ptrAdd(b, off + n), 0)
+    store64(ptrAdd(sb2, 8), off + n)
+    return sb2
+}
+
+# sbAppendInt(sb: Ptr, v: Int) -> Ptr：追加十进制整数
+def sbAppendInt[sb: Ptr, v: Int] -> Ptr {
+    return sbAppendStr(sb, intToStr(v))
+}
+
+# sbStr(sb: Ptr) -> Str：取当前内容（句柄仍可继续追加）
+def sbStr[sb: Ptr] -> Str {
+    return ptrToStr(intToPtr(load64(sb)))
+}
+
+# sbLen(sb: Ptr) -> Int：当前长度
+def sbLen[sb: Ptr] -> Int {
+    return load64(ptrAdd(sb, 8))
+}
+
+    on Start {
+        # 1) 基本追加
+        sb: Ptr = sbNew()
+        sb = sbAppendStr(sb, "EonOS ")
+        sb = sbAppendStr(sb, "on Whisker")
+        if sbStr(sb) == "EonOS on Whisker" {
+            print("sb 基本功能 OK")
+        } else {
+            print("sb 基本功能 FAIL: ", sbStr(sb))
+        }
+        # 2) 倍增扩容（200 字节长串，跨 64/128/256 三档）
+        sb2: Ptr = sbNew()
+        i: Int = 0
+        while i < 50 {
+            sb2 = sbAppendStr(sb2, "abcdefghij")
+            i = i + 1
+        }
+        if sbLen(sb2) == 500 {
+            if load8(ptrAdd(intToPtr(load64(sb2)), 500)) == 0 {
+                print("长串扩容 OK len=", sbLen(sb2))
+            } else {
+                print("长串扩容 FAIL: 缺 NUL")
+            }
+        } else {
+            print("长串扩容 FAIL: len=", sbLen(sb2))
+        }
+        # 3) 整数追加 + 链式
+        sb3: Ptr = sbNew()
+        sb3 = sbAppendStr(sb3, "n=")
+        sb3 = sbAppendInt(sb3, 123456)
+        sb3 = sbAppendStr(sb3, "!")
+        if sbStr(sb3) == "n=123456!" {
+            print("整数追加 OK")
+        } else {
+            print("整数追加 FAIL: ", sbStr(sb3))
+        }
+    }
+}
+

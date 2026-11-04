@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+web/shot.bmp
+native/m_*.json
+native/ui_via_gateway.html

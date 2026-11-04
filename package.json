@@ -1,0 +1,19 @@
+{
+  "name": "eonos",
+  "version": "1.0.0",
+  "description": "EonOS - AI + Desktop + Tools Unified Platform",
+  "main": "server.py",
+  "scripts": {
+    "start": "python -m eonos",
+    "dev": "python -m eonos --debug",
+    "chat": "python -m eonos --port 8001"
+  },
+  "dependencies": {
+    "python": ">=3.8"
+  },
+  "optional_dependencies": {
+    "ai_model": ["torch", "transformers"],
+    "desktop": ["pyautogui", "Pillow", "pytesseract"],
+    "remote_api": ["aiohttp"]
+  }
+}

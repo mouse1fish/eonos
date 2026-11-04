@@ -1,0 +1,15 @@
+# agent_smoke.wk —— 安全冒烟：屏幕尺寸 / 光标位置 / 截屏 / VK 映射（不真的按键）
+actor Main {
+    on Start {
+        w: Int = screenW()
+        h: Int = screenH()
+        print("屏幕 ", w, "x", h)
+        x: Int = mouseX()
+        y: Int = mouseY()
+        print("光标 (", x, ",", y, ")")
+        n: Int = screenshot("G:/trea-Eon-os/eonos/web/shot.bmp")
+        print("截屏写出 ", n, " 字节")
+        vk: Int = keyVk(65)
+        print("字符 A 的 VK=", vk)
+    }
+}

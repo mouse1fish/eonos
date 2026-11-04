@@ -1,0 +1,950 @@
+# httpd.wk —— EonOS 原生 HTTP 服务器（纯 Whisker，零依赖）
+#
+# 架构：HttpAcceptor 阻塞 accept；每连接 spawn 一个 HttpConn actor
+#       （阻塞读 → 解析 → 路由 → 响应 → 关闭，actor 隔离天然并发）
+# 路由：GET /（状态页）| GET /api/status | GET /api/time | POST /api/echo | 其余 404
+# 限制：单请求头+体 16KB 上限；Connection: close（无 keep-alive）；
+#       缓冲区走 bump 分配器不回收（连接级 16KB，量入为出）
+# 约定：def 最多 3 参数（语言限制）；handler 内不使用 return（统一收敛到 if/else）
+
+actor HttpConn {
+    sock: Int = 0
+
+    on Handle[s: Int] {
+        sock = s
+        serve()
+    }
+
+    # ---- 主流程：读全请求 → 路由 → 响应 → 关闭 ----
+    def serve {
+        buf: Ptr = alloc(16384)
+        total: Int = 0
+        headEnd: Int = 0 - 1
+        bodyNeed: Int = 0
+        readOk: Int = 1
+        done: Int = 0
+        while done == 0 and total < 16384 {
+            n: Int = netRecv(sock, ptrAdd(buf, total), 16384 - total)
+            if n <= 0 {
+                done = 1
+                if headEnd < 0 { readOk = 0 }
+            } else {
+                total = total + n
+                if headEnd < 0 {
+                    headEnd = findHeadEnd(buf, total)
+                    if headEnd >= 0 {
+                        cl: Int = contentLength(buf, headEnd)
+                        if cl > 0 {
+                            bodyNeed = cl
+                        } else {
+                            bodyNeed = 0
+                        }
+                    }
+                }
+                if headEnd >= 0 {
+                    if total >= headEnd + bodyNeed { done = 1 }
+                }
+            }
+        }
+        if readOk == 1 and headEnd >= 0 {
+            mGet: Bool = reqMethod(buf, "GET")
+            mPost: Bool = reqMethod(buf, "POST")
+            path: Str = reqPath(buf, 4096)
+            body: Str = bodyStr(buf, headEnd, bodyNeed)
+            # ==== 网关模式：原生路由白名单之外，全部反代到 Python 平台（:8001 内部）====
+            native: Int = 0
+            if mGet {
+                if path == "/api/time" {
+                    native = 1
+                } elif path == "/native" {
+                    native = 1
+                } elif path == "/api/frontdoor" {
+                    native = 1
+                } elif path == "/api/ai/models" {
+                    native = 1
+                } elif path == "/api/agent/status" {
+                    native = 1
+                } elif path == "/api/shot.bmp" {
+                    native = 1
+                } elif path == "/" {
+                    native = 1
+                } elif matchBytes(buf, pathStart(buf, 4096), "/ui/") {
+                    native = 1
+                }
+            } elif mPost {
+                if path == "/api/echo" {
+                    native = 1
+                } elif path == "/api/exec" {
+                    native = 1
+                } elif path == "/api/ai/chat" {
+                    native = 1
+                } elif path == "/api/screenshot" {
+                    native = 1
+                } elif path == "/api/mouse" {
+                    native = 1
+                } elif path == "/api/command" {
+                    native = 1
+                } elif path == "/api/type" {
+                    native = 1
+                }
+            }
+            if native == 0 {
+                upreq: Str = buildUpstream(reqMethodStr(buf), path, body)
+                proxyRoundTrip(sock, upreq)
+                netClose(sock)
+                return
+            }
+            # ==== 原生路由 ====
+            if mGet {
+                if path == "/api/time" {
+                    sendAll(sock, respStr("200 OK", "application/json", timeJson()))
+                } elif path == "/native" {
+                    sendAll(sock, respStr("200 OK", "text/html; charset=utf-8", nativePage()))
+                } elif path == "/api/frontdoor" {
+                    sendAll(sock, respStr("200 OK", "application/json", frontdoorJson()))
+                } elif path == "/api/ai/models" {
+                    vllmModelsRelay(sock)
+                } elif path == "/api/agent/status" {
+                    agentStatus(sock)
+                } elif path == "/api/shot.bmp" {
+                    shotBig(sock)
+                } elif path == "/" {
+                    serveFile(sock, "index.html", "text/html; charset=utf-8")
+                } else {
+                    rel: Str = tailFrom(path, 4)
+                    if hasDotDot(rel) {
+                        sendAll(sock, respStr("400 Bad Request", "application/json", '{"error":"bad path"}'))
+                    } else {
+                        serveFile(sock, rel, mimeOf(rel))
+                    }
+                }
+            } else {
+                if path == "/api/echo" {
+                    sendAll(sock, respStr("200 OK", "text/plain; charset=utf-8", body))
+                } elif path == "/api/exec" {
+                    cmd: Str = jsonGetStr(body, "command")
+                    if strLen(cmd) == 0 {
+                        sendAll(sock, respStr("400 Bad Request", "application/json", '{"error":"missing command"}'))
+                    } else {
+                        sendAll(sock, respStr("200 OK", "application/json", execCapture(cmd)))
+                    }
+                } elif path == "/api/screenshot" {
+                    agentShot(sock)
+                } elif path == "/api/mouse" {
+                    agentMouse(sock, body)
+                } elif path == "/api/command" {
+                    agentCommand(sock, body)
+                } elif path == "/api/type" {
+                    agentType(sock, body)
+                } else {
+                    vllmChat(sock, body)
+                }
+            }
+        } else {
+            sendAll(sock, respStr("400 Bad Request", "text/plain", "bad request"))
+        }
+        netClose(sock)
+    }
+
+    # ---- HTTP 解析助手 ----
+
+    # 头部结束（\r\n\r\n）位置，返回头体分界；未找到 -1
+    def findHeadEnd[p: Ptr, total: Int] -> Int {
+        i: Int = 0
+        while i + 3 < total {
+            if load8(ptrAdd(p, i)) == 13 {
+                if load8(ptrAdd(p, i + 1)) == 10 {
+                    if load8(ptrAdd(p, i + 2)) == 13 {
+                        if load8(ptrAdd(p, i + 3)) == 10 {
+                            return i + 4
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    # Content-Length 头的值；无该头返回 -1（只扫头部区，且要求行首匹配）
+    def contentLength[p: Ptr, headEnd: Int] -> Int {
+        i: Int = 0
+        while i < headEnd {
+            atLineStart: Int = 0
+            if i == 0 {
+                atLineStart = 1
+            } elif load8(ptrAdd(p, i - 1)) == 10 {
+                atLineStart = 1
+            }
+            if atLineStart == 1 {
+                if matchBytes(p, i, "Content-Length:") {
+                    return hdrNum(p, i + 15, headEnd)
+                }
+            }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    # 从 off 起跳过空格读十进制数；读不到返回 -1
+    def hdrNum[p: Ptr, off: Int, lim: Int] -> Int {
+        i: Int = off
+        v: Int = 0
+        got: Int = 0
+        while i < lim {
+            c: Int = load8(ptrAdd(p, i))
+            if c == 32 and got == 0 {
+                i = i + 1
+            } elif c >= 48 and c <= 57 {
+                v = v * 10 + (c - 48)
+                got = 1
+                i = i + 1
+            } else {
+                i = lim
+            }
+        }
+        if got == 0 { return 0 - 1 }
+        return v
+    }
+
+    # p+off 起与 s 逐字节相等（按 s 长度）
+    def matchBytes[p: Ptr, off: Int, s: Str] -> Bool {
+        n: Int = strLen(s)
+        i: Int = 0
+        while i < n {
+            if load8(ptrAdd(p, off + i)) != load8(ptrAdd(strPtr(s), i)) {
+                return False
+            }
+            i = i + 1
+        }
+        return True
+    }
+
+    # 请求行是否以 s 开头且后跟空格
+    def reqMethod[p: Ptr, s: Str] -> Bool {
+        r: Bool = False
+        if matchBytes(p, 0, s) {
+            if load8(ptrAdd(p, strLen(s))) == 32 {
+                r = True
+            }
+        }
+        return r
+    }
+
+    # 提取请求行里的 PATH（第二段），返回 NUL 结尾字符串
+    def reqPath[p: Ptr, lim: Int] -> Str {
+        i: Int = 0
+        sp: Int = 0 - 1
+        while i < lim {
+            if load8(ptrAdd(p, i)) == 32 {
+                sp = i
+                i = lim
+            } else {
+                i = i + 1
+            }
+        }
+        out: Ptr = alloc(512)
+        j: Int = 0
+        if sp >= 0 {
+            i = sp + 1
+            done: Int = 0
+            while j < 500 and done == 0 {
+                c: Int = load8(ptrAdd(p, i + j))
+                if c == 32 or c == 13 or c == 10 {
+                    done = 1
+                } else {
+                    store8(ptrAdd(out, j), c)
+                    j = j + 1
+                }
+            }
+        }
+        store8(ptrAdd(out, j), 0)
+        return ptrToStr(out)
+    }
+
+    # 请求体转字符串（bodyNeed <= 0 时返回空串）
+    def bodyStr[p: Ptr, headEnd: Int, bodyNeed: Int] -> Str {
+        if bodyNeed <= 0 { return "" }
+        out: Ptr = alloc(bodyNeed + 1)
+        copyBytes(out, ptrAdd(p, headEnd), bodyNeed)
+        store8(ptrAdd(out, bodyNeed), 0)
+        return ptrToStr(out)
+    }
+
+    # ---- 反向代理（/api/ai/* → Python AI 层）----
+
+    # PATH 在请求缓冲区里的起始偏移（跳过 "METHOD "）
+    def pathStart[p: Ptr, lim: Int] -> Int {
+        i: Int = 0
+        while i < lim {
+            if load8(ptrAdd(p, i)) == 32 {
+                return i + 1
+            }
+            i = i + 1
+        }
+        return 0
+    }
+
+    # 请求方法转字符串（代理上游请求行用）
+    def reqMethodStr[p: Ptr] -> Str {
+        if matchBytes(p, 0, "POST") {
+            return "POST"
+        }
+        return "GET"
+    }
+
+    # 拼上游请求：HTTP/1.1 + Connection: close（EOF 定界，中继读到底即可）
+    def buildUpstream[m: Str, pth: Str, body: Str] -> Str {
+        r: Str = strCat(m, " ")
+        r = strCat(r, pth)
+        r = strCat(r, " HTTP/1.1\r\nHost: 127.0.0.1:8001\r\nContent-Length: ")
+        r = strCat(r, intToStr(strLen(body)))
+        r = strCat(r, "\r\nConnection: close\r\n\r\n")
+        return strCat(r, body)
+    }
+
+    # 中继往返：连 :8001 → 发上游请求 → 边收边转发给客户端，直到上游 EOF
+    def proxyRoundTrip[client: Int, req: Str] -> Int {
+        up: Int = netConnect("127.0.0.1", 8001)
+        if up < 0 {
+            sendAll(client, respStr("502 Bad Gateway", "application/json", '{"error":"ai layer offline"}'))
+            return 0 - 1
+        }
+        netSend(up, strPtr(req), strLen(req))
+        buf: Ptr = alloc(8192)
+        total: Int = 0
+        done: Int = 0
+        while done == 0 {
+            n: Int = netRecv(up, buf, 8192)
+            if n <= 0 {
+                done = 1
+            } else {
+                netSend(client, buf, n)
+                total = total + n
+            }
+        }
+        netClose(up)
+        return total
+    }
+
+    # ---- JSON / 命令执行（命令执行器）----
+
+    # 从 JSON 体取字符串字段（支持 \" \\ \/ \n \t \r 转义；\u 记 ?）；缺失返回 ""
+    def jsonGetStr[body: Str, key: Str] -> Str {
+        kp: Str = strCat("\"", key)
+        kp = strCat(kp, "\":")
+        bs: Ptr = strPtr(body)
+        n: Int = strLen(body)
+        klen: Int = strLen(kp)
+        i: Int = 0
+        found: Int = 0 - 1
+        while i + klen <= n {
+            if matchBytes(bs, i, kp) {
+                found = i
+                i = n
+            } else {
+                i = i + 1
+            }
+        }
+        sb: Ptr = sbNew()
+        if found < 0 { return "" }
+        j: Int = found + klen
+        vq: Int = 0 - 1
+        while j < n {
+            c: Int = load8(ptrAdd(bs, j))
+            if c == 34 {
+                vq = j
+                j = n
+            } elif c == 58 or c == 32 {
+                j = j + 1
+            } else {
+                j = n
+            }
+        }
+        if vq < 0 { return "" }
+        j = vq + 1
+        stop: Int = 0
+        while j < n and stop == 0 {
+            c: Int = load8(ptrAdd(bs, j))
+            if c == 34 {
+                stop = 1
+            } elif c == 92 {
+                j = j + 1
+                e: Int = load8(ptrAdd(bs, j))
+                if e == 110 {
+                    sb = sbAppendByte(sb, 10)
+                } elif e == 116 {
+                    sb = sbAppendByte(sb, 9)
+                } elif e == 114 {
+                    sb = sbAppendByte(sb, 13)
+                } elif e == 34 {
+                    sb = sbAppendByte(sb, 34)
+                } elif e == 92 {
+                    sb = sbAppendByte(sb, 92)
+                } elif e == 47 {
+                    sb = sbAppendByte(sb, 47)
+                } elif e == 117 {
+                    cp: Int = hex4(bs, j + 1)
+                    if cp >= 56320 and cp <= 57343 {
+                        cp = 63
+                    } elif cp >= 55296 and cp <= 56319 {
+                        if load8(ptrAdd(bs, j + 5)) == 92 and load8(ptrAdd(bs, j + 6)) == 117 {
+                            lo: Int = hex4(bs, j + 7)
+                            if lo >= 56320 and lo <= 57343 {
+                                cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                                j = j + 6
+                            } else {
+                                cp = 63
+                            }
+                        } else {
+                            cp = 63
+                        }
+                    }
+                    sb = sbAppendCp(sb, cp)
+                    j = j + 4
+                } else {
+                    sb = sbAppendByte(sb, 63)
+                }
+            } else {
+                sb = sbAppendByte(sb, c)
+            }
+            j = j + 1
+        }
+        return sbStr(sb)
+    }
+
+    # JSON 数字字段（"key": 123）-> Int（非负整数）
+    def jsonNum[body: Str, key: Str] -> Int {
+        kp: Str = strCat("\"", key)
+        kp = strCat(kp, "\":")
+        bs: Ptr = strPtr(body)
+        n: Int = strLen(body)
+        klen: Int = strLen(kp)
+        i: Int = 0
+        found: Int = 0 - 1
+        while i + klen <= n {
+            if matchBytes(bs, i, kp) {
+                found = i
+                i = n
+            } else {
+                i = i + 1
+            }
+        }
+        if found < 0 { return 0 }
+        j: Int = found + klen
+        v: Int = 0
+        while j < n {
+            c: Int = load8(ptrAdd(bs, j))
+            if c == 32 {
+                j = j + 1
+            } elif c >= 48 and c <= 57 {
+                v = v * 10 + (c - 48)
+                j = j + 1
+            } else {
+                j = n
+            }
+        }
+        return v
+    }
+
+    # 字符串 → JSON 安全转义
+    def jsonEscape[s: Str] -> Str {
+        sb: Ptr = sbNew()
+        n: Int = strLen(s)
+        i: Int = 0
+        while i < n {
+            c: Int = load8(ptrAdd(strPtr(s), i))
+            if c == 34 {
+                sb = sbAppendStr(sb, "\\\"")
+            } elif c == 92 {
+                sb = sbAppendStr(sb, "\\\\")
+            } elif c == 10 {
+                sb = sbAppendStr(sb, "\\n")
+            } elif c == 13 {
+                sb = sbAppendStr(sb, "\\r")
+            } elif c == 9 {
+                sb = sbAppendStr(sb, "\\t")
+            } elif c < 32 {
+                sb = sbAppendByte(sb, 32)
+            } else {
+                sb = sbAppendByte(sb, c)
+            }
+            i = i + 1
+        }
+        return sbStr(sb)
+    }
+
+    # 命令执行：cmd.exe /c <cmd>，strbuf 捕获输出（64KB 上限），返回 JSON
+    def execCapture[cmd: Str] -> Str {
+        full: Str = strCat("cmd.exe /c ", cmd)
+        p: Ptr = procSpawnPipe(full)
+        if isNull(p) {
+            return '{"error":"spawn failed","exit":-1,"output":""}'
+        }
+        sb: Ptr = sbNew()
+        buf: Ptr = alloc(8192)
+        total: Int = 0
+        done: Int = 0
+        while done == 0 {
+            n: Int = procRead(p, buf, 8192)
+            if n <= 0 {
+                done = 1
+            } else {
+                total = total + n
+                if total <= 65536 {
+                    sb = sbAppendBytes(sb, buf, n)
+                }
+            }
+        }
+        code: Int = procWait(p)
+        procFree(p)
+        if total > 65536 {
+            sb = sbAppendStr(sb, "\n[output truncated]")
+        }
+        r: Str = strCat('{"exit":', intToStr(code))
+        r = strCat(r, ',"output":"')
+        r = strCat(r, jsonEscape(sbStr(sb)))
+        r = strCat(r, '"}')
+        return r
+    }
+
+    # ---- 配置（eonos.conf 键值行；缺省用内置默认值）----
+    def cfgGet[key: Str, dflt: Str] -> Str {
+        fbuf: Ptr = alloc(4096)
+        n: Int = readBytes("G:/trea-Eon-os/eonos/native/eonos.conf", fbuf, 4096)
+        if n < 0 { return dflt }
+        store8(ptrAdd(fbuf, n), 0)
+        klen: Int = strLen(key)
+        i: Int = 0
+        while i < n {
+            atStart: Int = 0
+            if i == 0 {
+                atStart = 1
+            } elif load8(ptrAdd(fbuf, i - 1)) == 10 {
+                atStart = 1
+            }
+            if atStart == 1 {
+                if matchBytes(fbuf, i, key) {
+                    if load8(ptrAdd(fbuf, i + klen)) == 61 {
+                        sb: Ptr = sbNew()
+                        j: Int = i + klen + 1
+                        while j < n {
+                            c: Int = load8(ptrAdd(fbuf, j))
+                            if c == 10 or c == 13 {
+                                j = n
+                            } else {
+                                sb = sbAppendByte(sb, c)
+                                j = j + 1
+                            }
+                        }
+                        return sbStr(sb)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return dflt
+    }
+
+    def cfgInt[key: Str, dflt: Int] -> Int {
+        v: Str = cfgGet(key, "")
+        if strLen(v) == 0 { return dflt }
+        return strToInt(v)
+    }
+
+    # ---- agent 路由（截图 / 鼠标 / 键盘 / 命令，全原生）----
+    # 截屏大图专用路由（8MB 缓冲；通用静态服务上限 256KB，装不下全屏 BMP）
+    def shotBig[sock: Int] {
+        fbuf: Ptr = alloc(8388608)
+        n: Int = readBytes("G:/trea-Eon-os/eonos/web/shot.bmp", fbuf, 8388608)
+        if n < 0 {
+            sendAll(sock, respStr("404 Not Found", "application/json", '{"error":"no shot"}'))
+            return
+        }
+        h: Str = strCat("HTTP/1.1 200 OK\r\nContent-Type: image/bmp\r\nContent-Length: ", intToStr(n))
+        h = strCat(h, "\r\nConnection: close\r\n\r\n")
+        netSend(sock, strPtr(h), strLen(h))
+        netSend(sock, fbuf, n)
+    }
+
+    def agentStatus[sock: Int] {
+        res: Str = strCat('{"screen_w":', intToStr(screenW()))
+        res = strCat(res, ',"screen_h":')
+        res = strCat(res, intToStr(screenH()))
+        res = strCat(res, ',"mouse_x":')
+        res = strCat(res, intToStr(mouseX()))
+        res = strCat(res, ',"mouse_y":')
+        res = strCat(res, intToStr(mouseY()))
+        res = strCat(res, '}')
+        sendAll(sock, respStr("200 OK", "application/json", res))
+    }
+
+    def agentShot[sock: Int] {
+        n: Int = screenshot("G:/trea-Eon-os/eonos/web/shot.bmp")
+        if n < 0 {
+            sendAll(sock, respStr("500 Internal Server Error", "application/json", '{"error":"screenshot failed"}'))
+            return
+        }
+        res: Str = strCat('{"width":', intToStr(screenW()))
+        res = strCat(res, ',"height":')
+        res = strCat(res, intToStr(screenH()))
+        res = strCat(res, ',"bytes":')
+        res = strCat(res, intToStr(n))
+        res = strCat(res, ',"image":"/ui/shot.bmp","ocr_text":""}')
+        sendAll(sock, respStr("200 OK", "application/json", res))
+    }
+
+    def agentMouse[sock: Int, body: Str] {
+        act: Str = jsonGetStr(body, "action")
+        x: Int = jsonNum(body, "x")
+        y: Int = jsonNum(body, "y")
+        btn: Int = 1
+        bt: Str = jsonGetStr(body, "button")
+        if bt == "right" {
+            btn = 2
+        } elif bt == "middle" {
+            btn = 3
+        }
+        if act == "move" {
+            mouseMove(x, y)
+        } elif act == "down" {
+            mouseDown(btn)
+        } elif act == "up" {
+            mouseUp(btn)
+        } else {
+            mouseMove(x, y)
+            mouseDown(btn)
+            mouseUp(btn)
+        }
+        sendAll(sock, respStr("200 OK", "application/json", '{"success":true}'))
+    }
+
+    def agentType[sock: Int, body: Str] {
+        txt: Str = jsonGetStr(body, "text")
+        n: Int = strLen(txt)
+        i: Int = 0
+        typed: Int = 0
+        while i < n {
+            c: Int = load8(ptrAdd(strPtr(txt), i))
+            vk: Int = keyVk(c)
+            sh: Int = vk / 256
+            v: Int = vk % 256
+            if v >= 1 and v <= 254 {
+                if sh == 1 or sh == 3 {
+                    keyDown(16)
+                }
+                keyDown(v)
+                keyUp(v)
+                if sh == 1 or sh == 3 {
+                    keyUp(16)
+                }
+                typed = typed + 1
+            }
+            i = i + 1
+        }
+        res: Str = strCat('{"typed":', intToStr(typed))
+        res = strCat(res, ',"total":')
+        res = strCat(res, intToStr(n))
+        res = strCat(res, '}')
+        sendAll(sock, respStr("200 OK", "application/json", res))
+    }
+
+    def agentCommand[sock: Int, body: Str] {
+        cmd: Str = jsonGetStr(body, "command")
+        if strLen(cmd) == 0 {
+            sendAll(sock, respStr("400 Bad Request", "application/json", '{"error":"missing command"}'))
+            return
+        }
+        full: Str = execCapture(cmd)
+        out: Str = jsonGetStr(full, "output")
+        code: Int = jsonNum(full, "exit")
+        res: Str = strCat('{"stdout":"', jsonEscape(out))
+        res = strCat(res, '","stderr":"","exit":')
+        res = strCat(res, intToStr(code))
+        res = strCat(res, ',"duration":"native"}')
+        sendAll(sock, respStr("200 OK", "application/json", res))
+    }
+
+    # ---- vLLM 客户端（OpenAI 兼容 HTTP，Whisker 直连）----
+    def hex4[p: Ptr, off: Int] -> Int {
+        v: Int = 0
+        i: Int = 0
+        while i < 4 {
+            c: Int = load8(ptrAdd(p, off + i))
+            d: Int = 0
+            if c >= 48 and c <= 57 {
+                d = c - 48
+            } elif c >= 97 and c <= 102 {
+                d = c - 87
+            } elif c >= 65 and c <= 70 {
+                d = c - 55
+            }
+            v = v * 16 + d
+            i = i + 1
+        }
+        return v
+    }
+
+    def sbAppendCp[sb: Ptr, cp: Int] -> Ptr {
+        if cp < 128 {
+            return sbAppendByte(sb, cp)
+        } elif cp < 2048 {
+            sb = sbAppendByte(sb, 192 + cp / 64)
+            return sbAppendByte(sb, 128 + cp % 64)
+        } elif cp < 65536 {
+            sb = sbAppendByte(sb, 224 + cp / 4096)
+            sb = sbAppendByte(sb, 128 + (cp / 64) % 64)
+            return sbAppendByte(sb, 128 + cp % 64)
+        } else {
+            sb = sbAppendByte(sb, 240 + cp / 262144)
+            sb = sbAppendByte(sb, 128 + (cp / 4096) % 64)
+            sb = sbAppendByte(sb, 128 + (cp / 64) % 64)
+            return sbAppendByte(sb, 128 + cp % 64)
+        }
+    }
+
+    def readAll[sock: Int] -> Str {
+        sb: Ptr = sbNew()
+        rbuf: Ptr = alloc(8192)
+        done: Int = 0
+        while done == 0 {
+            n: Int = netRecv(sock, rbuf, 8192)
+            if n <= 0 {
+                done = 1
+            } else {
+                sb = sbAppendBytes(sb, rbuf, n)
+            }
+        }
+        return sbStr(sb)
+    }
+
+    def httpRound[host: Str, port: Int, req: Str] -> Str {
+        s: Int = netConnect(host, port)
+        if s < 0 { return "" }
+        netSend(s, strPtr(req), strLen(req))
+        r: Str = readAll(s)
+        netClose(s)
+        return r
+    }
+
+    def bodyOf[resp: Str] -> Str {
+        e: Int = findHeadEnd(strPtr(resp), strLen(resp))
+        if e < 0 { return "" }
+        return tailFrom(resp, e)
+    }
+
+    def buildModelsReq[host: Str, port: Int] -> Str {
+        r: Str = strCat("GET /v1/models HTTP/1.1\r\nHost: ", host)
+        r = strCat(r, ":")
+        r = strCat(r, intToStr(port))
+        r = strCat(r, "\r\nConnection: close\r\n\r\n")
+        return r
+    }
+
+    def buildChatReq[host: Str, port: Int, payload: Str] -> Str {
+        r: Str = strCat("POST /v1/chat/completions HTTP/1.1\r\nHost: ", host)
+        r = strCat(r, ":")
+        r = strCat(r, intToStr(port))
+        r = strCat(r, "\r\nContent-Type: application/json\r\nContent-Length: ")
+        r = strCat(r, intToStr(strLen(payload)))
+        r = strCat(r, "\r\nConnection: close\r\n\r\n")
+        return strCat(r, payload)
+    }
+
+    def buildChatPayload[model: Str, msg: Str] -> Str {
+        pl: Str = strCat("{\"model\":\"", model)
+        pl = strCat(pl, "\",\"messages\":[{\"role\":\"user\",\"content\":\"")
+        pl = strCat(pl, jsonEscape(msg))
+        pl = strCat(pl, "\"}],\"max_tokens\":512,\"temperature\":0.7}")
+        return pl
+    }
+
+    def discoverModel[host: Str, port: Int] -> Str {
+        raw: Str = httpRound(host, port, buildModelsReq(host, port))
+        if strLen(raw) == 0 { return "" }
+        return jsonGetStr(bodyOf(raw), "id")
+    }
+
+    def vllmModelsRelay[sock: Int] {
+        host: Str = cfgGet("vllm_host", "127.0.0.1")
+        port: Int = cfgInt("vllm_port", 8002)
+        raw: Str = httpRound(host, port, buildModelsReq(host, port))
+        if strLen(raw) == 0 {
+            sendAll(sock, respStr("502 Bad Gateway", "application/json", '{"error":"vllm offline"}'))
+            return
+        }
+        sendAll(sock, respStr("200 OK", "application/json", bodyOf(raw)))
+    }
+
+    def vllmChat[sock: Int, body: Str] {
+        msg: Str = jsonGetStr(body, "message")
+        if strLen(msg) == 0 {
+            sendAll(sock, respStr("400 Bad Request", "application/json", '{"error":"missing message"}'))
+            return
+        }
+        host: Str = cfgGet("vllm_host", "127.0.0.1")
+        port: Int = cfgInt("vllm_port", 8002)
+        model: Str = jsonGetStr(body, "model")
+        if strLen(model) == 0 {
+            model = discoverModel(host, port)
+        }
+        if strLen(model) == 0 {
+            sendAll(sock, respStr("502 Bad Gateway", "application/json", '{"error":"vllm offline or no model"}'))
+            return
+        }
+        raw: Str = httpRound(host, port, buildChatReq(host, port, buildChatPayload(model, msg)))
+        if strLen(raw) == 0 {
+            sendAll(sock, respStr("502 Bad Gateway", "application/json", '{"error":"vllm offline"}'))
+            return
+        }
+        reply: Str = jsonGetStr(bodyOf(raw), "content")
+        if strLen(reply) == 0 {
+            sendAll(sock, respStr("502 Bad Gateway", "application/json", '{"error":"no content from model"}'))
+            return
+        }
+        res: Str = strCat('{"response":"', jsonEscape(reply))
+        res = strCat(res, '","model":"')
+        res = strCat(res, jsonEscape(model))
+        res = strCat(res, '","backend":"vllm"}')
+        sendAll(sock, respStr("200 OK", "application/json", res))
+    }
+
+    # ---- 静态文件服务（Whisker 直接读盘发文件，零 Python）----
+
+    def endsWith[s: Str, suf: Str] -> Bool {
+        n: Int = strLen(s)
+        m: Int = strLen(suf)
+        if m > n { return False }
+        return matchBytes(strPtr(s), n - m, suf)
+    }
+
+    def tailFrom[s: Str, off: Int] -> Str {
+        sb: Ptr = sbNew()
+        n: Int = strLen(s)
+        i: Int = off
+        while i < n {
+            sb = sbAppendByte(sb, load8(ptrAdd(strPtr(s), i)))
+            i = i + 1
+        }
+        return sbStr(sb)
+    }
+
+    def hasDotDot[s: Str] -> Bool {
+        n: Int = strLen(s)
+        pp: Ptr = strPtr(s)
+        i: Int = 0
+        while i + 1 < n {
+            if load8(ptrAdd(pp, i)) == 46 {
+                if load8(ptrAdd(pp, i + 1)) == 46 {
+                    return True
+                }
+            }
+            i = i + 1
+        }
+        return False
+    }
+
+    def mimeOf[f: Str] -> Str {
+        if endsWith(f, ".html") { return "text/html; charset=utf-8" }
+        if endsWith(f, ".css") { return "text/css" }
+        if endsWith(f, ".js") { return "application/javascript" }
+        if endsWith(f, ".json") { return "application/json" }
+        if endsWith(f, ".png") { return "image/png" }
+        if endsWith(f, ".svg") { return "image/svg+xml" }
+        if endsWith(f, ".ico") { return "image/x-icon" }
+        return "application/octet-stream"
+    }
+
+    # 读盘发文件（web 根：G:/trea-Eon-os/eonos/web/）
+    def serveFile[sock: Int, rel: Str, ctype: Str] -> Int {
+        full: Str = strCat("G:/trea-Eon-os/eonos/web/", rel)
+        fbuf: Ptr = alloc(262144)
+        n: Int = readBytes(full, fbuf, 262144)
+        if n < 0 {
+            sendAll(sock, respStr("404 Not Found", "application/json", '{"error":"file not found"}'))
+            return 0 - 1
+        }
+        h: Str = strCat("HTTP/1.1 200 OK\r\nContent-Type: ", ctype)
+        h = strCat(h, "\r\nContent-Length: ")
+        h = strCat(h, intToStr(n))
+        h = strCat(h, "\r\nConnection: close\r\n\r\n")
+        netSend(sock, strPtr(h), strLen(h))
+        return netSend(sock, fbuf, n)
+    }
+
+    # ---- 响应 ----
+
+    def respStr[status: Str, ctype: Str, body: Str] -> Str {
+        h: Str = strCat("HTTP/1.1 ", status)
+        h = strCat(h, "\r\nContent-Type: ")
+        h = strCat(h, ctype)
+        h = strCat(h, "\r\nContent-Length: ")
+        h = strCat(h, intToStr(strLen(body)))
+        h = strCat(h, "\r\nConnection: close\r\n\r\n")
+        return strCat(h, body)
+    }
+
+    def sendAll[s: Int, resp: Str] -> Int {
+        return netSend(s, strPtr(resp), strLen(resp))
+    }
+
+    # ---- 路由产物 ----
+
+    def frontdoorJson -> Str {
+        s: Str = '{"frontdoor":"whisker","system":"EonOS","lang":"whisker","version":"0.2.0"'
+        s = strCat(s, ',"mode":"gateway","uptime_ms":')
+        s = strCat(s, intToStr(wallMs()))
+        s = strCat(s, '}')
+        return s
+    }
+
+    def timeJson -> Str {
+        s: Str = '{"uptime_ms":'
+        s = strCat(s, intToStr(wallMs()))
+        s = strCat(s, '}')
+        return s
+    }
+
+    def nativePage -> Str {
+        s: Str = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>EonOS 前门</title></head><body>'
+        s = strCat(s, '<h1>EonOS 原生前门（网关模式）</h1>')
+        s = strCat(s, '<p>Whisker 原生进程是唯一对外监听者：静态路由直答，其余反代到内部平台。</p>')
+        s = strCat(s, '<ul><li><a href="/">平台 UI（反代）</a></li>')
+        s = strCat(s, '<li><a href="/api/frontdoor">GET /api/frontdoor</a></li>')
+        s = strCat(s, '<li><a href="/api/time">GET /api/time</a></li>')
+        s = strCat(s, '<li>POST /api/echo · POST /api/exec</li></ul>')
+        s = strCat(s, '</body></html>')
+        return s
+    }
+}
+
+actor HttpAcceptor {
+    on Listen[port: Int] {
+        netInit()
+        ls: Int = netListenLocal(port)
+        if ls < 0 {
+            print("[eonos-httpd] 监听失败 err=", netErr())
+        } else {
+            print("[eonos-httpd] 已监听 http://127.0.0.1:", port)
+            live: Int = 1
+            while live == 1 {
+                cs: Int = netAccept(ls)
+                if cs >= 0 {
+                    conn: ActorRef[HttpConn] = spawn HttpConn
+                    conn.send(Handle(cs))
+                } else {
+                    print("[eonos-httpd] accept 失败 err=", netErr())
+                    sleepMs(100)
+                }
+            }
+        }
+    }
+}
+
+actor Main {
+    on Start {
+        acc: ActorRef[HttpAcceptor] = spawn HttpAcceptor
+        acc.send(Listen(8000))
+        print("[eonos-httpd] 启动中…")
+    }
+}

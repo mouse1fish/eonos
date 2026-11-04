@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EonOS - Universal AI System</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0f;color:#e0e0e0;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.header{display:flex;align-items:center;padding:0 16px;background:linear-gradient(135deg,#0d0d15,#1a1a2e);border-bottom:1px solid #1a1a2e;height:44px;flex-shrink:0}
+.header .logo{font-size:15px;font-weight:700;color:#00ff88;margin-right:16px}
+.header .logo .ver{font-size:10px;color:#555;font-weight:400;margin-left:6px}
+.header .nav{display:flex;gap:2px;flex:1}
+.header .nav button{padding:8px 18px;background:transparent;border:none;border-bottom:2px solid transparent;color:#666;font-size:13px;cursor:pointer;transition:all .2s}
+.header .nav button:hover{color:#aaa}
+.header .nav button.active{color:#00ff88;border-bottom-color:#00ff88}
+.header .status{display:flex;align-items:center;gap:8px;margin-left:auto}
+.badge{padding:2px 8px;border-radius:4px;font-size:10px}
+.badge.ok{background:#003322;color:#00ff88}
+.badge.loading{background:#332200;color:#ffaa00}
+.badge.gpu{background:#220033;color:#aa88ff}
+.badge.cpu{background:#003322;color:#88ffaa}
+.tab-content{flex:1;display:none;overflow:hidden}
+.tab-content.active{display:flex;flex-direction:column}
+.chat-area{flex:1;overflow-y:auto;padding:16px 20px}
+.msg{margin-bottom:14px;display:flex;gap:10px}
+.msg.user{flex-direction:row-reverse}
+.msg .avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.msg.ai .avatar{background:#1a1a2e;border:1px solid #00ff88}
+.msg.user .avatar{background:#1a1a2e;border:1px solid #4a9eff}
+.msg .bubble{max-width:72%;padding:10px 14px;border-radius:12px;font-size:13px;line-height:1.6;word-break:break-word}
+.msg.ai .bubble{background:#1a1a2e;border:1px solid #2a2a4e}
+.msg.user .bubble{background:#16213e;border:1px solid #2a4a6e}
+.input-area{padding:12px 20px;background:#0d0d15;border-top:1px solid #1a1a2e;display:flex;gap:10px;align-items:flex-end}
+.input-area textarea{flex:1;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:8px;color:#e0e0e0;padding:10px;font-size:13px;resize:none;height:40px;max-height:100px;font-family:inherit;outline:none}
+.input-area textarea:focus{border-color:#00ff88}
+.input-area button{padding:10px 20px;background:#00ff88;color:#000;border:none;border-radius:8px;font-size:13px;font-weight:bold;cursor:pointer;white-space:nowrap}
+.input-area button:hover{background:#00cc6a}
+.welcome{text-align:center;padding:50px 20px;color:#555}
+.welcome h2{color:#00ff88;font-size:22px;margin-bottom:12px}
+.welcome p{margin-bottom:6px;font-size:13px}
+.welcome .cmd{color:#888;font-family:monospace;background:#1a1a2e;padding:2px 8px;border-radius:4px}
+.tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;padding:16px;overflow-y:auto}
+.tool-card{padding:10px;border:1px solid #2a2a4e;border-radius:8px;cursor:pointer;transition:all .2s}
+.tool-card:hover{border-color:#00ff88;background:#111122}
+.tool-card .name{font-size:12px;color:#00ff88;font-weight:500}
+.tool-card .desc{font-size:11px;color:#666;margin-top:2px}
+.tool-card .tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;margin-top:4px}
+.tool-card .tag.ai{background:#003322;color:#00ff88}
+.tool-card .tag.mcp{background:#001a33;color:#4a9eff}
+.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;padding:16px;overflow-y:auto}
+.status-card{background:#1a1a2e;border:1px solid #2a2a4e;border-radius:12px;padding:20px}
+.status-card h3{font-size:13px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
+.status-card .value{font-size:28px;font-weight:bold;color:#00ff88}
+.status-card .sub{font-size:12px;color:#666;margin-top:4px}
+.status-card .detail{font-size:11px;color:#555;margin-top:8px;line-height:1.5}
+.hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;padding:16px;overflow-y:auto}
+.hw-card{background:#1a1a2e;border:1px solid #2a2a4e;border-radius:12px;padding:20px}
+.hw-card h3{font-size:13px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.hw-card h3 .icon{font-size:16px}
+.hw-card .big{font-size:24px;font-weight:bold;color:#00ff88}
+.hw-card .info{font-size:12px;color:#888;margin-top:4px;line-height:1.6}
+.hw-card .gpu-item{padding:8px 0;border-bottom:1px solid #222}
+.hw-card .gpu-item:last-child{border-bottom:none}
+.hw-card .gpu-name{color:#aa88ff;font-size:13px;font-weight:500}
+.hw-card .gpu-mem{color:#666;font-size:11px}
+.mode-badge{display:inline-block;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:bold}
+.mode-badge.multi-gpu{background:#220033;color:#aa88ff}
+.mode-badge.single-gpu{background:#003322;color:#88ffaa}
+.mode-badge.hybrid{background:#003333;color:#88ffff}
+.mode-badge.multi-cpu{background:#332200;color:#ffaa88}
+.mode-badge.single-cpu{background:#222;color:#aaa}
+.event-log{padding:16px;overflow-y:auto;font-family:monospace;font-size:11px}
+.event-item{padding:4px 8px;border-bottom:1px solid #111}
+.event-item .type{color:#00ff88}
+.event-item .source{color:#4a9eff}
+.event-item .time{color:#555;float:right}
+</style>
+</head>
+<body>
+<div class="header">
+<div class="logo">EonOS<span class="ver">v1.0 Universal</span></div>
+<div class="nav">
+<button class="active" onclick="switchTab('chat',this)">Chat</button>
+<button onclick="switchTab('tools',this)">Tools</button>
+<button onclick="switchTab('status',this)">Status</button>
+<button onclick="switchTab('hardware',this)">Hardware</button>
+<button onclick="switchTab('events',this)">Events</button>
+</div>
+<div class="status">
+<span class="badge loading" id="engineBadge">Engine</span>
+<span class="badge" id="hwBadge">--</span>
+</div>
+</div>
+
+<div class="tab-content active" id="tab-chat">
+<div class="chat-area" id="chatArea">
+<div class="welcome">
+<h2>EonOS Universal</h2>
+<p>Multi-CPU / Multi-GPU / Single-CPU / Single-GPU Adaptive</p>
+<p style="margin-top:16px">Commands:</p>
+<p><span class="cmd">screenshot</span> - Take screenshot</p>
+<p><span class="cmd">run: dir</span> - Execute command</p>
+<p><span class="cmd">click 100 200</span> - Mouse click</p>
+<p><span class="cmd">tools</span> - List all tools</p>
+<p><span class="cmd">hardware</span> - Show hardware info</p>
+</div>
+</div>
+<div class="input-area">
+<textarea id="input" placeholder="Type message... (Enter to send)" rows="1"></textarea>
+<button onclick="sendMessage()">Send</button>
+</div>
+</div>
+
+<div class="tab-content" id="tab-tools">
+<div class="tools-grid" id="toolsGrid"></div>
+</div>
+
+<div class="tab-content" id="tab-status">
+<div class="status-grid" id="statusGrid"></div>
+</div>
+
+<div class="tab-content" id="tab-hardware">
+<div class="hw-grid" id="hwGrid"></div>
+</div>
+
+<div class="tab-content" id="tab-events">
+<div class="event-log" id="eventLog"></div>
+</div>
+
+<script>
+function switchTab(name,btn){
+document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));
+document.getElementById('tab-'+name).classList.add('active');
+btn.classList.add('active');
+if(name==='tools')loadTools();
+if(name==='status')loadStatus();
+if(name==='hardware')loadHardware();
+if(name==='events')loadEvents();
+}
+
+async function api(path,method='GET',body=null){
+const opts={method,headers:{'Content-Type':'application/json'}};
+if(body)opts.body=JSON.stringify(body);
+const res=await fetch(path,opts);
+return res.json();
+}
+
+async function sendMessage(){
+const input=document.getElementById('input');
+const msg=input.value.trim();
+if(!msg)return;
+input.value='';
+addMsg('user',msg);
+
+if(msg==='screenshot'||msg==='截图'){
+const r=await api('/api/screenshot','POST');
+addMsg('ai',`Screenshot: ${r.width}x${r.height}<br><img src="/api/shot.bmp" style="max-width:100%;margin-top:6px;border-radius:6px">`);
+return;
+}
+if(msg.startsWith('run:')){
+const cmd=msg.substring(4).trim();
+const r=await api('/api/command','POST',{command:cmd});
+addMsg('ai',`$ ${cmd}\n${r.stdout||r.stderr}\n[${r.duration}] Completion event emitted`);
+return;
+}
+if(msg.startsWith('click ')){
+const[x,y]=msg.substring(6).split(' ').map(Number);
+const r=await api('/api/mouse','POST',{action:'click',x,y});
+addMsg('ai',`Click (${x},${y}): ${r.success?'OK':'FAIL'}`);
+return;
+}
+if(msg.startsWith('type:')){
+const t=msg.substring(5).trim();
+const r=await api('/api/type','POST',{text:t});
+addMsg('ai',Type "": /);
+return;
+}
+if(msg==='tools'){
+switchTab('tools',document.querySelectorAll('.nav button')[1]);
+return;
+}
+if(msg==='hardware'||msg==='硬件'){
+switchTab('hardware',document.querySelectorAll('.nav button')[3]);
+return;
+}
+
+const r=await api('/api/ai/chat','POST',{message:msg});
+addMsg('ai',r.response||r.error||'No response');
+if(r.session_id)window._sessionId=r.session_id;
+}
+
+function addMsg(role,text){
+const area=document.getElementById('chatArea');
+const div=document.createElement('div');
+div.className='msg '+role;
+div.innerHTML=`<div class="avatar">${role==='ai'?'AI':'U'}</div><div class="bubble">${text.replace(/\n/g,'<br>')}</div>`;
+area.appendChild(div);
+area.scrollTop=area.scrollHeight;
+}
+
+async function loadTools(){
+const r=await api('/api/tools');
+const grid=document.getElementById('toolsGrid');
+grid.innerHTML=r.tools.map(t=>`<div class="tool-card"><div class="name">${t.name}</div><div class="desc">${t.description}</div><span class="tag ${t.is_ai_mouse?'ai':'mcp'}">${t.is_ai_mouse?'AI Mouse':'MCP'}</span></div>`).join('');
+}
+
+async function loadStatus(){
+const r=await api('/api/status');
+const grid=document.getElementById('statusGrid');
+const modeClass=r.compute_mode||'single-cpu';
+grid.innerHTML=`
+<div class="status-card"><h3>Engine</h3><div class="value">${r.engine_ready?'Ready':'Loading'}</div><div class="sub">${r.backend} / ${r.compute_mode}</div></div>
+<div class="status-card"><h3>Hardware</h3><div class="value" style="font-size:16px">${r.hardware_summary||'detecting...'}</div><div class="sub"><span class="mode-badge ${modeClass}">${r.compute_mode||'auto'}</span></div></div>
+<div class="status-card"><h3>Tools</h3><div class="value">${r.tools_count}</div><div class="sub">Available</div></div>
+<div class="status-card"><h3>Platform</h3><div class="value">${r.platform}</div><div class="sub">EonOS v${r.version}</div></div>
+`;
+document.getElementById('engineBadge').className='badge '+(r.engine_ready?'ok':'loading');
+document.getElementById('engineBadge').textContent=r.engine_ready?'Ready':'Loading';
+const hwB=document.getElementById('hwBadge');
+hwB.textContent=r.compute_mode||'--';
+hwB.className='badge '+(r.compute_mode&&r.compute_mode.includes('gpu')?'gpu':'cpu');
+}
+
+async function loadHardware(){
+const r=await api('/api/hardware');
+const hw=r.engine||{};
+const plat=r.platform||{};
+const grid=document.getElementById('hwGrid');
+const mode=hw.compute_mode||'auto';
+const modeClass=mode.replace('_','-');
+let gpuHtml='';
+if(hw.gpus&&hw.gpus.length){
+gpuHtml=hw.gpus.map(g=>`<div class="gpu-item"><div class="gpu-name">GPU ${g.index}: ${g.name}</div><div class="gpu-mem">VRAM: ${g.vram_total_mb}MB${g.vram_free_mb?' (Free: '+g.vram_free_mb+'MB)':''}${g.compute_capability?' CC: '+g.compute_capability:''}</div></div>`).join('');
+}else{
+gpuHtml='<div class="info">No GPU detected - CPU-only mode</div>';
+}
+grid.innerHTML=`
+<div class="hw-card"><h3><span class="icon">&#9881;</span> Compute Mode</h3><div class="big"><span class="mode-badge ${modeClass}">${mode.toUpperCase()}</span></div><div class="info">Batch: ${hw.recommended?.batch_size||1} | Threads: ${hw.recommended?.threads||1} | Ctx: ${hw.recommended?.ctx_size||2048} | GPU Layers: ${hw.recommended?.gpu_layers||0}</div></div>
+<div class="hw-card"><h3><span class="icon">&#9775;</span> CPU</h3><div class="big">${hw.cpu_count||1} Cores</div><div class="info">${hw.cpu_name||'Unknown'}<br>Architecture: ${plat.cpu_arch||'unknown'}</div></div>
+<div class="hw-card"><h3><span class="icon">&#9889;</span> GPU</h3><div class="big">${hw.gpu_count||0} Device${hw.gpu_count!==1?'s':''}</div>${gpuHtml}<div class="info" style="margin-top:8px">CUDA: ${hw.has_cuda?'Yes':'No'} | ROCm: ${hw.has_rocm?'Yes':'No'} | Metal: ${hw.has_metal?'Yes':'No'} | Vulkan: ${hw.has_vulkan?'Yes':'No'}</div></div>
+<div class="hw-card"><h3><span class="icon">&#128190;</span> Memory</h3><div class="big">${plat.ram_total_gb||hw.ram_total_gb||0} GB</div><div class="info">Available: ${plat.ram_available_gb||0} GB<br>Disk: ${plat.disk_total_gb||0} GB (Free: ${plat.disk_free_gb||0} GB)</div></div>
+`;
+}
+
+async function loadEvents(){
+const r=await api('/api/events');
+const log=document.getElementById('eventLog');
+log.innerHTML=r.events.reverse().map(e=>`<div class="event-item"><span class="type">${e.type}</span> <span class="source">[${e.source}]</span> ${JSON.stringify(e.data).substring(0,100)} <span class="time">${new Date(e.time*1000).toLocaleTimeString()}</span></div>`).join('');
+}
+
+document.getElementById('input').addEventListener('keydown',e=>{
+if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();}
+});
+
+loadStatus();
+setInterval(loadStatus,10000);
+</script>
+</body>
+</html>

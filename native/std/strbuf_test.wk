@@ -1,0 +1,41 @@
+# strbuf_test.wk —— strbuf 标准库验收：追加/倍增扩容/整数/读取
+# 期望输出：sb 基本功能 OK / 长串扩容 OK / 整数追加 OK
+actor Main {
+    on Start {
+        # 1) 基本追加
+        sb: Ptr = sbNew()
+        sb = sbAppendStr(sb, "EonOS ")
+        sb = sbAppendStr(sb, "on Whisker")
+        if sbStr(sb) == "EonOS on Whisker" {
+            print("sb 基本功能 OK")
+        } else {
+            print("sb 基本功能 FAIL: ", sbStr(sb))
+        }
+        # 2) 倍增扩容（200 字节长串，跨 64/128/256 三档）
+        sb2: Ptr = sbNew()
+        i: Int = 0
+        while i < 50 {
+            sb2 = sbAppendStr(sb2, "abcdefghij")
+            i = i + 1
+        }
+        if sbLen(sb2) == 500 {
+            if load8(ptrAdd(intToPtr(load64(sb2)), 500)) == 0 {
+                print("长串扩容 OK len=", sbLen(sb2))
+            } else {
+                print("长串扩容 FAIL: 缺 NUL")
+            }
+        } else {
+            print("长串扩容 FAIL: len=", sbLen(sb2))
+        }
+        # 3) 整数追加 + 链式
+        sb3: Ptr = sbNew()
+        sb3 = sbAppendStr(sb3, "n=")
+        sb3 = sbAppendInt(sb3, 123456)
+        sb3 = sbAppendStr(sb3, "!")
+        if sbStr(sb3) == "n=123456!" {
+            print("整数追加 OK")
+        } else {
+            print("整数追加 FAIL: ", sbStr(sb3))
+        }
+    }
+}
