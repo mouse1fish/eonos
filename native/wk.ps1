@@ -19,7 +19,7 @@ param(
 $ErrorActionPreference = "Stop"
 $wkTool = "G:\trea-Eon-os\trea-xiancheng-bianyiqi"
 $wkcc2 = Join-Path $wkTool "build\wkcc2.exe"
-Set-Location $PSScriptRoot
+Set-Location $wkTool                    # blob 相对路径需要 CWD = 项目根
 
 if (-not (Test-Path $wkcc2)) { Write-Error "wkcc2.exe 不存在（先建立自举链）"; exit 1 }
 if (-not (Test-Path $Main)) { Write-Error "找不到 $Main"; exit 1 }
