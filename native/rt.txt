@@ -1,0 +1,2 @@
+[wkcc] 编译 build/lex_input.txt -> build/selfhost.exe
+read fail

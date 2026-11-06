@@ -1,0 +1,7 @@
+actor Main {
+    on Start {
+        blob: Ptr = alloc(25799)
+        n: Int = readBytes("build/rt_blob.bin", blob, 25799)
+        print("read=", n, " 头4字节=", load8(blob), " ", load8(ptrAdd(blob, 1)))
+    }
+}
