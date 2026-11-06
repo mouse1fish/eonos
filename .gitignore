@@ -4,3 +4,6 @@ __pycache__/
 web/shot.bmp
 native/m_*.json
 native/ui_via_gateway.html
+
+native/*.log
+native/rt.txt
