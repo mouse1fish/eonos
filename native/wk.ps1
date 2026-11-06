@@ -17,8 +17,13 @@ param(
     [string]$o
 )
 $ErrorActionPreference = "Stop"
-$wkTool = "G:\trea-Eon-os\trea-xiancheng-bianyiqi"
+$wkTool = "H:\trea-Eon-os\trea-xiancheng-bianyiqi"
 $wkcc2 = Join-Path $wkTool "build\wkcc2.exe"
+
+# 路径归一化：输入统一解析为绝对路径（基于调用者 CWD，必须在 Set-Location 之前）
+$Main = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Main)
+$Rest = @($Rest | ForEach-Object { if ($_ -eq "-o") { $_ } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($_) } })
+
 Set-Location $wkTool                    # blob 相对路径需要 CWD = 项目根
 
 if (-not (Test-Path $wkcc2)) { Write-Error "wkcc2.exe 不存在（先建立自举链）"; exit 1 }
@@ -39,7 +44,8 @@ foreach ($inc in $Rest) {
 
 $tmp = Join-Path $env:TEMP ("wk_" + [guid]::NewGuid().ToString("N") + ".wk")
 $src | Set-Content -Path $tmp -Encoding UTF8
-$outExe = if ($o) { Join-Path $PSScriptRoot $o } else { Join-Path $PSScriptRoot ([IO.Path]::ChangeExtension($Main, ".exe")) }
+$outBase = [IO.Path]::ChangeExtension($Main, ".exe")
+$outExe = if ($o) { Join-Path $PSScriptRoot $o } elseif ([IO.Path]::IsPathRooted($outBase)) { $outBase } else { Join-Path $PSScriptRoot $outBase }
 
 & $wkcc2 $tmp $outExe
 $rc = $LASTEXITCODE
